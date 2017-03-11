@@ -34,23 +34,45 @@
 #include "thread.h"
 #include "tt.h"
 #include "uci.h"
+
+#ifdef SYZYGY_TB
 #include "syzygy/tbprobe.h"
+#endif
+
+#ifdef LOMONOSOV_TB
+#include "lomonosov_probe.h"
+#endif
 
 namespace Search {
 
   SignalsType Signals;
   LimitsType Limits;
   StateStackPtr SetupStates;
+ RootMoveVector rootMoves;
+ // Position RootPos;
+  uint64_t TBHits;
+#ifdef LOMONOSOV_TB
+  // Lomonosov TB
+  bool lomonosov_tb_loaded = false;
+  bool lomonosov_tb_use_opt = true;
+  bool use_tables = false;
+  int max_tb_pieces = 0;
+  Depth lomonosov_probe_depth_min = ONE_PLY;
+  Depth lomonosov_probe_depth_max = DEPTH_MAX;
+#endif
+
 }
 
 namespace Tablebases {
 
+#ifdef SYZYGY_TB
   int Cardinality;
   uint64_t Hits;
   bool RootInTB;
   bool UseRule50;
   Depth ProbeDepth;
   Value Score;
+#endif
 }
 
 namespace TB = Tablebases;
@@ -233,7 +255,8 @@ void MainThread::search() {
   int contempt = Options["Contempt"] * PawnValueEg / 100; // From centipawns
   DrawValue[ us] = VALUE_DRAW - Value(contempt);
   DrawValue[~us] = VALUE_DRAW + Value(contempt);
-
+  TBHits = 0;
+#ifdef SYZYGY_TB
   TB::Hits = 0;
   TB::RootInTB = false;
   TB::UseRule50 = Options["Syzygy50MoveRule"];
@@ -246,7 +269,7 @@ void MainThread::search() {
       TB::Cardinality = TB::MaxCardinality;
       TB::ProbeDepth = DEPTH_ZERO;
   }
-
+#endif
   if (rootMoves.empty())
   {
       rootMoves.push_back(RootMove(MOVE_NONE));
@@ -256,6 +279,7 @@ void MainThread::search() {
   }
   else
   {
+#ifdef SYZYGY_TB
       if (    TB::Cardinality >=  rootPos.count<ALL_PIECES>(WHITE)
                                 + rootPos.count<ALL_PIECES>(BLACK)
           && !rootPos.can_castle(ANY_CASTLING))
@@ -287,7 +311,29 @@ void MainThread::search() {
                                                       :  VALUE_DRAW;
           }
       }
-
+#endif
+#ifdef LOMONOSOV_TB
+	  if (lomonosov_tb_loaded && lomonosov_tb_use_opt)
+		  use_tables = true;
+	  else
+		  use_tables = false;
+	  lomonosov_probe_depth_min = Options["Lomonosov Depth Min"] * ONE_PLY;
+	  lomonosov_probe_depth_max = Options["Lomonosov Depth Max"] * ONE_PLY;
+	  bool root_is_win_dtm = false;
+	  if (use_tables && (max_tb_pieces >= rootPos.count<ALL_PIECES>(WHITE)
+		  +rootPos.count<ALL_PIECES>(BLACK))) {
+		  TBHits = rootMoves.size() + 1;
+		  if (lomonosov_root_probe(rootPos, &root_is_win_dtm)) {
+			  if (!root_is_win_dtm) {
+				  // The current root position is in the tablebases.
+				  // RootMoves now contains only moves that preserve the draw or win.
+				  // Do not probe tablebases during the search.
+				  use_tables = false;
+			  }
+		  }
+	  }
+	  if (!root_is_win_dtm) {
+#endif
       for (Thread* th : Threads)
       {
           th->maxPly = 0;
@@ -299,7 +345,24 @@ void MainThread::search() {
               th->start_searching();
           }
       }
-
+#ifdef LOMONOSOV_TB
+	  }
+	  else {
+		  sync_cout << "info depth 0 score "
+			  // << UCI::mate_value(RootMoves[0].score)// CAMBIO
+			  << UCI::value(rootMoves[0].score)// CAMBIO
+			  << " pv";
+		  for (size_t j = 0; j < rootMoves[0].pv.size(); ++j)
+			  std::cout << " " << UCI::move(rootMoves[0].pv[j], rootPos.is_chess960());
+		  std::cout << sync_endl;
+	  }
+#endif
+#ifdef SYZYGY_TB
+	  if (RootInTB)
+	  {
+		  // If we mangled the hash key, unmangle it here
+	  }
+#endif
       Thread::search(); // Let's start searching!
   }
 
@@ -599,6 +662,19 @@ namespace {
   template <NodeType NT>
   Value search(Position& pos, Stack* ss, Value alpha, Value beta, Depth depth, bool cutNode) {
 
+#if defined(SYZYGY_TB) && defined(LOMONOSOV_TB)
+	  Value syzygy_value = (Value)0;
+	  Value lomonosov_value = (Value)0;
+#endif
+#ifdef SYZYGY_TB
+	  bool syzygy_success = false;
+	  bool syzygy_probe = false;
+#endif
+#ifdef LOMONOSOV_TB
+	  bool lomonosov_success = false;
+	  bool lomonosov_probe = false;
+#endif
+
     const bool PvNode = NT == PV;
     const bool rootNode = PvNode && (ss-1)->ply == 0;
 
@@ -695,6 +771,7 @@ namespace {
     }
 
     // Step 4a. Tablebase probe
+#ifdef SYZYGY_TB
     if (!rootNode && TB::Cardinality)
     {
         int piecesCnt = pos.count<ALL_PIECES>(WHITE) + pos.count<ALL_PIECES>(BLACK);
@@ -715,7 +792,9 @@ namespace {
                 value =  v < -drawScore ? -VALUE_MATE + MAX_PLY + ss->ply
                        : v >  drawScore ?  VALUE_MATE - MAX_PLY - ss->ply
                                         :  VALUE_DRAW + 2 * v * drawScore;
-
+#ifdef LOMONOSOV_TB
+				syzygy_value = value;
+#else
                 tte->save(posKey, value_to_tt(value, ss->ply), BOUND_EXACT,
                           std::min(DEPTH_MAX - ONE_PLY, depth + 6 * ONE_PLY),
                           MOVE_NONE, VALUE_NONE, TT.generation());
@@ -724,6 +803,81 @@ namespace {
             }
         }
     }
+#endif
+#endif
+#ifdef LOMONOSOV_TB
+	/*Depth d1 = lomonosov_probe_depth_min;
+	Depth d2 = lomonosov_probe_depth_max;
+	bool l1 = depth >= d1;
+	bool l2 = depth <= d2;
+	if (l1 && l2)
+	int asd = 2;
+	int mtp = max_tb_pieces;
+	int pp = (pos.count<ALL_PIECES>(WHITE) + pos.count<ALL_PIECES>(BLACK));*/
+	lomonosov_probe = (use_tables && !rootNode
+		&& depth >= lomonosov_probe_depth_min
+		&& depth <= lomonosov_probe_depth_max
+		//&& pos.rule50_count() == 0
+		&& (pos.count<ALL_PIECES>(WHITE) +pos.count<ALL_PIECES>(BLACK)) <= max_tb_pieces);
+	if (lomonosov_probe) {
+		int v;
+		if ((lomonosov_success = lomonosov_tbprobe(pos, ss->ply, &v, true))) {
+			value = (Value)v;
+#ifdef SYZYGY_TB
+			lomonosov_value = value;
+#else
+			TBHits++;
+
+			tte->save(posKey, value_to_tt(value, ss->ply), BOUND_EXACT,
+				std::min(DEPTH_MAX - ONE_PLY, depth + 6 * ONE_PLY),
+				MOVE_NONE, VALUE_NONE, TT.generation());
+
+			return value;
+#endif
+		}
+	}
+#endif
+
+#if defined(LOMONOSOV_TB) && defined(SYZYGY_TB)
+	if (syzygy_probe != lomonosov_probe) {
+		printf("!!!!! syzygy_probe = %d, lomonosov_probe = %d\n", syzygy_probe, lomonosov_probe);
+		//	printf("use_tables = %d, pos.total_piece_count() = %d, max_tb_pieces = %d, TBCardinality = %d, TBProbeDepth = %d\n",
+		//	use_tables, pos.total_piece_count(), max_tb_pieces, TBCardinality, TBProbeDepth);
+		printf("use_tables = %d,  max_tb_pieces = %d, TBCardinality = %d, TBProbeDepth = %d\n",
+			use_tables, max_tb_pieces, TBCardinality, TBProbeDepth);
+		exit(0);
+	}
+	else if (syzygy_probe) {
+		if (syzygy_success != lomonosov_success) {
+			printf("!!!!! syzygy_success = %d, lomonosov_success = %d\n", syzygy_success, lomonosov_success);
+			printf("fen = %s\n", pos.fen().c_str());
+			exit(1);
+		}
+		else if (syzygy_success) {
+			if (syzygy_value != lomonosov_value) {
+				Signals.stop = true;
+				printf("!!!!! syzygy_value = %d, lomonosov_value = %d\n", syzygy_value, lomonosov_value);
+				printf("fen = %s\n", pos.fen().c_str());
+				Position pos_tmp = pos;
+				int success;
+				int vs = Tablebases::probe_wdl(pos_tmp, &success), vl;
+				success = lomonosov_tbprobe(pos, 0, &vl, false);
+				printf("second: syzygy = %d, lomonosov = %d\n", vs, vl);
+				exit(2);
+			}
+			else {
+				TBHits++;
+
+				tte->save(posKey, value_to_tt(value, ss->ply), BOUND_EXACT,
+					std::min(DEPTH_MAX - ONE_PLY, depth + 6 * ONE_PLY),
+					MOVE_NONE, VALUE_NONE, TT.generation());
+
+				return value;
+			}
+		}
+	}
+#endif
+
 
     // Step 5. Evaluate the position statically
     if (inCheck)
@@ -1555,9 +1709,11 @@ string UCI::pv(const Position& pos, Depth depth, Value alpha, Value beta) {
 
       Depth d = updated ? depth : depth - ONE_PLY;
       Value v = updated ? rootMoves[i].score : rootMoves[i].previousScore;
-
-      bool tb = TB::RootInTB && abs(v) < VALUE_MATE - MAX_PLY;
-      v = tb ? TB::Score : v;
+	  bool tb = false;
+#ifdef SYZYGY_TB
+	  bool tb = TB::RootInTB && abs(v) < VALUE_MATE - MAX_PLY;
+	  v = tb ? TB::Score : v;
+#endif
 
       if (ss.rdbuf()->in_avail()) // Not at first line
           ss << "\n";
@@ -1577,7 +1733,7 @@ string UCI::pv(const Position& pos, Depth depth, Value alpha, Value beta) {
       if (elapsed > 1000) // Earlier makes little sense
           ss << " hashfull " << TT.hashfull();
 
-      ss << " tbhits "   << TB::Hits
+	  ss << " tbhits " << TBHits // TB::Hits
          << " time "     << elapsed
          << " pv";
 
